@@ -1,0 +1,11 @@
+tqdm
+pandas
+scikit-learn
+numpy
+torch==1.6.0
+torchvision==0.7.0
+transformers
+scipy
+matplotlib
+pandas
+h5py

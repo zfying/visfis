@@ -1,0 +1,818 @@
+---
+title: "data_analysis"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(scales)
+library(latex2exp)
+library(extrafont)
+library(extrafontdb)
+library(reticulate)
+library(stringr)
+library(cocor)
+library(hash)
+library(ggplot2)
+library(cowplot)
+library(gridExtra)
+library(grid)
+py_install("pandas")
+py_install("pickle")
+```
+
+```{r load data}
+source_python("read_pickle.py")
+paths <- c(
+  '/path/to/data/here.pkl'
+)
+data <- data.frame()
+for (path in paths){
+  load_data <- read_pickle_file(path)
+  load_data <- data.frame(load_data)
+  sprintf('Loading %s...', path)
+  load_data$seed = as.double(load_data$seed)
+  load_data$qid = as.double(load_data$qid)
+  load_data$gt_answers <- as.character(load_data$gt_answers)
+  load_data$qtype <- as.character(load_data$qtype)
+  load_data$acc <- as.numeric(load_data$acc)
+  load_data$RRR_unc_pred <- as.numeric(load_data$RRR_unc_pred)
+  load_data$output_gt <- as.character(load_data$output_gt)
+  load_data$FI_method <- as.character(load_data$FI_method)
+  data <- bind_rows(data, load_data)
+}
+names(data)
+rm(load_data)
+```
+
+```{r helper functions}
+
+errorUpper <- function(x){
+x.mean <- mean(x)
+x.sd <- sd(x)
+
+SEM <- x.sd / (sqrt(length(x)))
+
+return(x.mean + (SEM*1.96))
+}
+
+errorLower <- function(x){
+x.mean <- mean(x)
+x.sd <- sd(x)
+
+SEM <- x.sd / (sqrt(length(x)))
+
+return(x.mean - (SEM*1.96))
+}
+
+max_vec <- function(x){
+  sapply(x, function(x){
+    x <- as.vector(x)
+    return(max(x))
+  })}
+
+mean_vec <- function(x){
+  sapply(x, function(x){
+    x <- as.vector(x)
+    return(mean(x))
+  })}
+
+softmax <- function(x){
+  exp(x) / sum(exp(x))
+}
+
+elementwise_softmax <- function(x){
+  exp(x) / (1+exp(x))
+}
+
+output_pred_from_logits <- function(x){
+  sapply(x, function(x){
+    x <- as.vector(x)
+    return(max(softmax(x)))
+  })}
+
+```
+
+
+```{r bootstrap code}
+
+bootstrapGRID = function(grid_data, bootTimes=100000, print_p = TRUE, x100=TRUE){
+  # bootstrap difference in metrics between two models, resampling model seeds (columns) and data points
+  stats <- rep(NA,bootTimes)
+  n_rows <- nrow(grid_data)
+  n_cols <- ncol(grid_data)
+  for (bi in 1:bootTimes){
+    row_idx = sample(x=1:n_rows, size=n_rows, replace=TRUE)
+    col_idx = sample(x=1:n_cols, size=n_cols, replace=TRUE)
+    res <- grid_data[row_idx, col_idx]
+    stats[bi] <- mean(as.matrix(res), na.rm=TRUE)
+  }
+  mean <- mean(stats)
+  quantiles <- quantile(stats,c(.025,.975))
+  lb <- quantiles[1]
+  ub <- quantiles[2]
+  p_value <- p_value(stats)
+  if (x100) {mult_factor <- 100} else {mult_factor <- 1}
+  if (print_p){
+    str_format = sprintf('%.2f \u00B1 %.2f (p = %.4f)', mult_factor*mean, mult_factor*(ub-lb)/2, p_value)
+  }
+  else{
+    str_format = sprintf('%.2f \u00B1 %.2f', mult_factor*mean, mult_factor*(ub-lb)/2)
+    # true +/- is \u00B1
+  }
+  return(str_format)
+}
+
+p_value <- function(betas){
+  # calculate p-value for two-sided difference from 0 test with a bootstrapped distribution of statistics, beta
+  abs_mean_beta = abs(mean(betas))
+  centered_betas = betas - mean(betas)
+  outside_prop = mean(centered_betas < -abs_mean_beta) + mean(centered_betas > abs_mean_beta)
+  return(outside_prop)
+}
+
+
+```
+
+
+```{r globals}
+
+theme = theme(axis.ticks = element_blank(),
+        axis.text = element_text(size=15, color='black'),
+        axis.line.x = element_line(colour = 'black', size = .6),
+        axis.line.y = element_line(colour = 'black', size = .6),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        panel.grid = element_line(colour = '#DFDFDF', size = 0),
+        plot.title = element_text(hjust = 0.5),
+        text = element_text(size=16, family="serif"),
+        legend.text = element_text(size=16),
+        legend.box.background = element_blank(),
+        legend.position = "right")
+
+cbp1 <- c("#E69F00", "#56B4E9", "#009E73",
+          "#0072B2", "#D55E00", "#999999", "#F0E442",  "#CC79A7", "#FFC20A", "#0C7BDC", "#994F00", "#006CD1", "#E1BE6A", "#40B0A6", "#E66100", "#5D3A9B", "#1AFF1A","#4B0092", "#FEFE62", "#D35FB7", "#005AB5", "#DC3220", "#1A85FF", "#D41159")
+
+```
+
+
+```{r add variables}
+
+data <- data %>%
+  mutate(
+    seed_num = ifelse(seed==7, 0,
+               ifelse(seed==77, 1,
+               ifelse(seed==777, 2,
+               ifelse(seed==7777, 3,
+               ifelse(seed==77777, 4, NA))))),
+    model_id = paste(dataset, model_type, model_name, sprintf('sd%d', seed_num), sep='.'),
+    experiment_x_model_name = paste(dataset, model_type, model_name, sep='.'),
+    experiment_name = paste(dataset, model_name, sep='.'),
+    has_FI = ifelse(dataset=='clevrxaicp', human_impt_max >= .85,
+             ifelse(dataset=='hatcp', human_impt_max >= .55,
+             ifelse(dataset=='gqacp', human_impt_max >= .45, NA))),
+    qtype_other = ifelse(dataset=='hatcp' & qtype == 'other', 'other',
+                  ifelse(dataset=='hatcp' & qtype != 'other', 'not-other',
+                  qtype
+                  ))
+    )
+
+data %>%
+  group_by(model_id) %>%
+  summarise(n())
+
+```
+
+
+```{r filter vqa to be other question type only}
+
+data <- data %>%
+  filter(dataset != 'hatcp' | qtype == 'other')
+
+```
+
+
+```{r check avg metrics by experiment}
+
+data %>%
+  group_by(model_id, split) %>%
+  summarise(acc = mean(acc)) %>%
+  spread(split, acc)
+
+by_experiment <- data %>%
+  group_by(model_id, split) %>%
+  summarise(acc = mean(acc),
+            human_impt_max = mean(human_impt_max),
+            human_impt_min = mean(human_impt_min),
+            RRR_suff = mean(RRR_suff),
+            RRR_inv = mean(RRR_inv),
+            RRR_unc_pred = mean(RRR_unc_pred, na.rm=TRUE),
+            RRR_unc_gt = mean(RRR_unc_gt),
+            output_pred = mean(output_pred),
+            output_gt = mean(output_gt, na.rm=TRUE),
+            suff_model = mean(suff_model),
+            comp_model = mean(comp_model),
+            plau_rank_corr = mean(plau_rank_corr, na.rm=TRUE),
+            plau_iou = mean(plau_iou, na.rm=TRUE),
+            model_name=min(model_name),
+            experiment_x_model_name=min(experiment_x_model_name),
+            experiment_name=min(experiment_name),
+            FI_method=min(FI_method)
+            ) %>%
+  ungroup()
+  
+by_experiment %>%
+  group_by(experiment_x_model_name, split) %>%
+  summarise(acc = mean(acc)) %>%
+  spread(split, acc) %>% write_csv('results/mean_acc_all.csv')
+
+```
+
+
+```{r MAKE BY_DATA_POINT}
+
+# quantile based cut-offs
+(qs <- quantile(data %>% filter(split!='train') %>% pull(suff_model), seq(0,1,.1)))
+suff_lb <- qs[4]
+suff_ub <- qs[8]
+(qs <- quantile(data %>% filter(split!='train') %>% pull(comp_model), seq(0,1,.1)))
+comp_lb <- qs[4]
+comp_ub <- qs[8]
+
+# absolute cut-offs
+suff_lb <- .01
+suff_ub <- .3
+
+comp_lb <- .1
+comp_ub <- .5
+
+by_data_point <- data %>%
+  filter(split!='train') %>%
+  mutate(unique_id = paste(model_id, qid, sep='.'),
+         suff_level = ifelse(suff_model < suff_lb, 'Best',
+                      ifelse(suff_model < suff_ub, 'Middle',
+                      ifelse(suff_model >= suff_ub, 'Worst', NA))),
+         suff_level = factor(suff_level, levels=c('Worst', 'Middle', 'Best')),
+         comp_level = ifelse(comp_model < comp_lb, 'Worst',
+                      ifelse(comp_model < comp_ub, 'Middle',
+                      ifelse(comp_model >= comp_ub, 'Best', NA))),
+         comp_level = factor(comp_level, levels=c('Worst', 'Middle', 'Best')),
+         split = ifelse(split=='test-id', 'ID',
+                 ifelse(split=='test-ood', 'OOD', split))
+         )
+
+
+```
+
+
+```{r make TEST_BY_EXPERIMENT: add faithful-alignment metrics}
+
+suff_model <- glm(acc ~ plau_rank_corr * suff_level, data=by_data_point, family='binomial')
+comp_model <- glm(acc ~ plau_rank_corr * comp_level, data=by_data_point, family='binomial')
+
+by_data_point$faith_align_suff <- predict(suff_model, by_data_point)
+by_data_point$faith_align_comp <- predict(comp_model, by_data_point)
+by_data_point$align_score <- elementwise_softmax(by_data_point$faith_align_suff)
+by_data_point$align_score_comp <- elementwise_softmax(by_data_point$faith_align_comp)
+
+mean((by_data_point$faith_align_suff > .5) == by_data_point$acc, na.rm=TRUE)
+mean((by_data_point$faith_align_comp > .5) == by_data_point$acc, na.rm=TRUE)
+
+test_by_experiment <- by_data_point %>%
+  filter(split!='train') %>%
+  group_by(model_id, split) %>%
+  summarise(acc = mean(acc),
+            human_impt_max = mean(human_impt_max),
+            human_impt_min = mean(human_impt_min),
+            RRR_suff = mean(RRR_suff),
+            RRR_inv = mean(RRR_inv),
+            RRR_unc_pred = mean(RRR_unc_pred),
+            RRR_unc_gt = mean(RRR_unc_gt),
+            align_score = mean(align_score, na.rm=TRUE),
+            align_score_comp = mean(align_score_comp, na.rm=TRUE),
+            output_pred = mean(output_pred),
+            output_gt = mean(output_gt),
+            suff_model = mean(suff_model),
+            comp_model = mean(comp_model),
+            plau_rank_corr = mean(plau_rank_corr, na.rm=TRUE),
+            plau_iou = mean(plau_iou, na.rm=TRUE),
+            faith_align_suff = mean(faith_align_suff, na.rm=TRUE),
+            faith_align_comp = mean(faith_align_comp, na.rm=TRUE),
+            model_name=min(model_name),
+            experiment_name=min(experiment_name),
+            experiment_x_model_name=min(experiment_x_model_name),
+            FI_method=min(FI_method),
+            dataset=min(dataset),
+            prop_suff_worst=mean(suff_level=='Worst'),
+            prop_suff_middle=mean(suff_level=='Middle'),
+            prop_suff_best=mean(suff_level=='Best'),
+            prop_comp_worst=mean(suff_level=='Worst'),
+            prop_comp_middle=mean(suff_level=='Middle'),
+            prop_comp_best=mean(suff_level=='Best'),
+            ) %>%
+  ungroup()
+
+```
+
+
+```{r ADD SUFF_LEVEL/COMP_LEVEL TO TEST_BY_EXPERIMENT}
+
+# quantile based cut-offs
+(qs <- quantile(test_by_experiment %>% pull(suff_model), seq(0,1,.1)))
+suff_lb <- qs[4]
+suff_ub <- qs[8]
+(qs <- quantile(test_by_experiment %>% pull(comp_model), seq(0,1,.1)))
+comp_lb <- qs[4]
+comp_ub <- qs[8]
+
+# absolute cut-offs
+suff_lb <- .01
+suff_ub <- .25
+
+comp_lb <- .2
+comp_ub <- .4
+
+test_by_experiment <- test_by_experiment %>%
+  mutate(suff_level = ifelse(suff_model < suff_lb, 'Best',
+                      ifelse(suff_model < suff_ub, 'Middle',
+                      ifelse(suff_model >= suff_ub, 'Worst', NA))),
+         suff_level = factor(suff_level, levels=c('Worst', 'Middle', 'Best')),
+         comp_level = ifelse(comp_model < comp_lb, 'Worst',
+                      ifelse(comp_model < comp_ub, 'Middle',
+                      ifelse(comp_model >= comp_ub, 'Best', NA))),
+         comp_level = factor(comp_level, levels=c('Worst', 'Middle', 'Best')),
+         )
+
+testID_by_experiment <- test_by_experiment %>%
+  filter(split=='ID')
+
+```
+
+```{r final plot 1: acc ~ plausibility x faithfulness}
+
+(single_plot_combined <- by_data_point %>%
+  filter(dataset == 'clevrxaicp') %>%
+  filter(has_FI == 1) %>%
+  gather("metric", "faithfulness_level", suff_level, comp_level) %>%
+  ggplot(aes(plau_rank_corr, acc, group=faithfulness_level, color=faithfulness_level)) +
+  ylim(c(0,1)) + 
+  xlim(c(-1,1)) +
+  geom_smooth(method = glm, method.args= list(family="binomial"), se=FALSE) + 
+  scale_color_manual(values = c(cbp1), name="Explanation\nFaithfulness") + 
+  theme + 
+  theme(legend.title = element_text(size=16),
+        legend.position=c(0.84, 0.23),  
+        legend.background = element_rect(fill = "white", color = "#555555"),
+        legend.key = element_blank()) + 
+  xlab("Explanation Plausibility") + 
+  ylab("Accuracy") +
+  ggtitle("Datapoint-level Accuracy vs. Plausibility")
+) 
+
+(all_plot <- by_data_point %>%
+  sample_n(1000000) %>%
+  filter(dataset == 'clevrxaicp') %>%
+  gather("metric", "faithfulness_level", suff_level, comp_level) %>%
+  mutate(metric = ifelse(metric=='suff_level', 'Sufficiency', 
+                  ifelse(metric=='comp_level', 'Comprehensiveness', NA))) %>%
+  ggplot(aes(plau_rank_corr, acc, group=faithfulness_level, color=faithfulness_level)) + 
+  ylim(c(0,1)) + 
+  xlim(c(-1,1)) +
+  geom_smooth(method = glm, method.args= list(family="binomial"), se=FALSE) + 
+  theme + 
+  scale_color_manual(values = c(cbp1), name="Explanation\nFaithfulness") + 
+  xlab("Explanation Plausibility") + 
+  ylab("Model\nAccuracy") + 
+  ggtitle("Datapoint-level Accuracy vs. Plausibility") + 
+  theme(axis.title.y = element_text(vjust=.5, angle=0),
+        strip.background = element_rect(fill="white")) +
+  facet_grid(rows=vars(split), cols=vars(metric)))
+
+(all_plot_dataset <- by_data_point %>%
+  sample_n(1000000) %>%
+  gather("metric", "faithfulness_level", suff_level, comp_level) %>%
+  mutate(metric = ifelse(metric=='suff_level', 'Sufficiency', 
+                  ifelse(metric=='comp_level', 'Comprehensiveness', NA)),
+         dataset = ifelse(dataset == 'clevrxaicp', 'CLEVR-XAI',
+                   ifelse(dataset == 'gqacp', 'GQA',
+                   ifelse(dataset == 'hatcp', 'VQA', NA)))) %>%
+  ggplot(aes(plau_rank_corr, acc, group=faithfulness_level, color=faithfulness_level)) + 
+  # stat_summary_bin(fun='mean', bins=10, size=2, geom='point') + 
+  ylim(c(0,1)) + 
+  xlim(c(-1,1)) +
+  geom_smooth(method = glm, method.args= list(family="binomial"), se=FALSE) + 
+  theme + 
+  scale_color_manual(values = c(cbp1), name="Explanation\nFaithfulness") + 
+  xlab("Explanation Plausibility") + 
+  ylab("Model\nAccuracy") + 
+  ggtitle("Datapoint-level Accuracy vs. Plausibility") +
+  theme(axis.title.y = element_text(vjust=.5, angle=0),
+        strip.background = element_rect(fill="white")) +
+  facet_wrap(vars(dataset)))
+
+ggsave(single_plot_combined, filename = "figures/acc_by_plau_x_faith_single.pdf", device = cairo_pdf,
+       width = 7, height = 4.5, units = "in")
+
+ggsave(all_plot, filename = "figures/acc_by_plau_x_faith_all.pdf", device = cairo_pdf,
+       width = 9, height = 4, units = "in")
+
+ggsave(all_plot_dataset, filename = "figures/acc_by_plau_x_faith_dataset.pdf", device = cairo_pdf, 
+       width = 11, height = 4, units = "in")
+
+```
+
+```{r final plot 2: pareto frontier between suff and comp for objectives}
+
+unsupervised_models <- c("MAIN1_baseline", "MAIN2_BaselineCF", "OBJ2_SaliencyGuided")
+(pareto_plot3 <- 
+testID_by_experiment %>%
+  filter(dataset == 'clevrxaicp') %>%
+  filter(model_name != 'OBJ11_SuffUncertAlignFI0_KOI1sample') %>% # not including VisFIS with FI=KOI in final results because we tuned for accuracy and found that gradcam was better with VisFIS
+  group_by(model_name) %>%
+  summarise(comp_model=mean(comp_model),
+            suff_model=mean(suff_model)) %>%
+  mutate(supervision = ifelse(model_name %in% unsupervised_models, "Unsupervised", "Supervised")) %>%
+  ggplot(aes(comp_model, suff_model)) +
+  geom_point(aes(color=supervision), shape=19, size=2,
+             position=position_jitter(width = .02, height = .02, seed = 3)) + 
+  geom_smooth(method='lm', formula=y~poly(x,2), color='#909090', size=1, se=FALSE) +
+  xlab("Explanation Comprehensiveness") + 
+  ylab("Explanation Sufficiency") + 
+  coord_cartesian(xlim = c(.15, .5), ylim = c(-.13,.75), clip='off') + 
+  scale_y_continuous(breaks=seq(-.1, .7, .1)) +
+  scale_x_continuous(breaks=seq(-.1, .6, .1)) + 
+  scale_color_manual(values = c(cbp1), name="FI Supervision") + 
+  theme + 
+      theme(legend.title = element_text(size=16),
+     legend.position=c(0.29, 0.78),  
+     legend.background = element_rect(fill = "white", color = "#555555"),
+     legend.key = element_blank()) + 
+  annotate("rect", xmin = .35, xmax = .5, ymin = -.16, ymax = 0.06,
+         alpha = .25, fill = "#76E655") + 
+  annotation_custom(grid.text("Most explainable models", x=0.80,  y=0.275, gp=gpar(fontsize=14, fontfamily='serif'))) + 
+  annotation_custom(grid.text("Suff+Unc", x=0.729,  y=0.119, gp=gpar(fontsize=12, fontfamily='serif'))) + 
+  ggtitle("Pareto Frontier of Model Explainability")
+)
+
+save_plot(plot=pareto_plot3, filename = "figures/pareto_plot.pdf", device = cairo_pdf, 
+       base_width = 7.4, base_height = 4.2, units = "in")
+
+```
+
+```{r FINAL PLOT 3: question type bar chart for clevrxai}
+
+data %>%
+  filter(dataset=='clevrxaicp') %>%
+  filter(experiment_x_model_name %in% c('clevrxaicp.updn.MAIN6_SuffUncertAlignFI0_gradcam', 'clevrxaicp.updn.MAIN2_BaselineCF')) %>%
+  group_by(experiment_x_model_name, split, qtype_other) %>%
+  summarise(acc = mean(acc),
+            experiment_x_model_name=min(experiment_x_model_name)) %>%
+  spread(split, acc) %>%
+  arrange(qtype_other) %>%
+  write_csv('results/mean_acc_all_qtype_clevrxai.csv')
+
+(barplot <- data %>%
+  filter(dataset=='clevrxaicp') %>%
+  filter(experiment_x_model_name %in% c('clevrxaicp.updn.MAIN6_SuffUncertAlignFI0_gradcam', 'clevrxaicp.updn.MAIN2_BaselineCF')) %>%
+  group_by(experiment_x_model_name, split, qtype_other) %>%
+  summarise(acc = mean(acc),
+            experiment_x_model_name=min(experiment_x_model_name)) %>%
+  spread(split, acc) %>%
+  arrange(qtype_other) %>% 
+  mutate(condition = ifelse(experiment_x_model_name == 'clevrxaicp.updn.MAIN2_BaselineCF', 'Baseline', ifelse(experiment_x_model_name == 'clevrxaicp.updn.MAIN6_SuffUncertAlignFI0_gradcam', 'VisFIS')),
+         qtype_other = as.factor(qtype_other),
+         ID = get('test-id'),
+         OOD = get('test-ood')) %>%
+  ggplot(aes(qtype_other, OOD, group=condition, fill=condition)) + 
+  geom_bar(stat='identity', position='dodge', width=.5) + 
+  ylab("OOD Accuracy") + 
+  xlab("Question Type") + 
+  ggtitle("Supervision Improvement by Question Type") + 
+  ylim(c(0,1)) + 
+  scale_fill_manual(values = c(cbp1), name="Model") + 
+  theme + 
+  theme(axis.text.x = element_text(size=14, color='black', vjust=1, hjust=-.1, angle=-40))
+)
+
+save_plot(plot=barplot, filename = "figures/xai_barplot.pdf", device = cairo_pdf, 
+       base_width = 9.4, base_height = 4.2, units = "in")
+  
+
+```
+
+
+```{r conditional distributions of faithfulness/plausibility by model avg faithfulness}
+
+ID_by_data_point <- by_data_point %>%
+  filter(split=='ID')
+
+ID_by_data_point <- ID_by_data_point %>%
+       mutate(plau_level = ifelse(plau_rank_corr < 0, "Low",
+                             ifelse(plau_rank_corr < .5, "Middle",
+                             ifelse(plau_rank_corr >= .5, "High", NA))))
+
+model_level_stats <- ID_by_data_point %>%
+       mutate(plau_level = ifelse(plau_rank_corr < 0, "Low",
+                             ifelse(plau_rank_corr < .5, "Middle",
+                             ifelse(plau_rank_corr >= .5, "High", NA)))) %>%
+       group_by(model_id) %>%
+       summarise(model_plau = mean(plau_rank_corr, na.rm=TRUE),
+                 prop_plau_worst = mean(plau_level=='Low', na.rm=TRUE),
+                 prop_plau_middle = mean(plau_level=='Middle', na.rm=TRUE),
+                 prop_plau_best = mean(plau_level=='High', na.rm=TRUE),
+                 prop_suff_worst = mean(suff_level=='Worst', na.rm=TRUE),
+                 prop_suff_middle = mean(suff_level=='Middle', na.rm=TRUE),
+                 prop_suff_best = mean(suff_level=='Best', na.rm=TRUE),
+                 ) %>%
+       mutate(model_plau_level = ifelse(model_plau < 0, "Low",
+                             ifelse(model_plau < .15, "Middle",
+                             ifelse(model_plau >= .15, "High", NA))))
+       
+joined_data <- left_join(ID_by_data_point, model_level_stats, by='model_id')
+
+(conditional_table <- 
+joined_data %>%
+  filter(dataset=='clevrxaicp') %>%
+  na.omit() %>%
+  group_by(model_plau_level, suff_level, plau_level) %>%
+  summarise(
+    n=n()) %>%
+  ungroup() %>%
+  select(model_plau_level, suff_level, plau_level, n)  %>%
+  spread(suff_level, n) %>%
+  mutate(Total = (Worst + Middle + Best),
+         Worst = round(Worst / Total,2),
+         Middle = round(Middle / Total,2),
+         Best = round(Best / Total,2),
+         ) %>%
+  select(model_plau_level, plau_level, Worst, Middle, Best) %>%
+  mutate(plau_level = factor(plau_level, levels = c("Low", "Middle", "High")),
+         model_plau_level = factor(model_plau_level, levels = c("Low", "Middle", "High")),
+         ) %>%
+  arrange(model_plau_level, plau_level)
+)
+
+write_csv(conditional_table, 'results/conditional_table.csv')
+  
+
+```
+
+
+```{r OOD/RRR metric generalization. separate train and test data}
+
+OOD_acc_by_experiment <- test_by_experiment %>%
+  filter(split=='OOD') %>%
+  select(model_id, acc) %>%
+  mutate(OOD_acc = acc) %>%
+  ungroup() %>%
+  select(-acc)
+
+spread_by_experiment <- left_join(testID_by_experiment, OOD_acc_by_experiment, by='model_id') %>%
+  select(-split) 
+
+cvTimes <- 10000
+
+train_cors_acc <- rep(NA, cvTimes)
+train_cors_pred_prob <- rep(NA, cvTimes)
+train_cors_exp <- rep(NA, cvTimes)
+train_cors_linear <- rep(NA, cvTimes)
+train_cors_RRR <- rep(NA, cvTimes)
+train_cors_suff <- rep(NA, cvTimes)
+train_cors_inv <- rep(NA, cvTimes)
+train_cors_unc <- rep(NA, cvTimes)
+train_cors_align_score <- rep(NA, cvTimes)
+
+test_cors_acc <- rep(NA, cvTimes)
+test_cors_pred_prob <- rep(NA, cvTimes)
+test_cors_exp <- rep(NA, cvTimes)
+test_cors_linear <- rep(NA, cvTimes)
+test_cors_RRR <- rep(NA, cvTimes)
+test_cors_suff <- rep(NA, cvTimes)
+test_cors_inv <- rep(NA, cvTimes)
+test_cors_unc <- rep(NA, cvTimes)
+test_cors_align_score <- rep(NA, cvTimes)
+
+for (i in 1:cvTimes){
+  train_idx <- sample(1:nrow(spread_by_experiment), size=90, replace = FALSE)
+  test_idx <- setdiff(1:nrow(spread_by_experiment), train_idx)
+  
+  train_data <- spread_by_experiment[train_idx,]
+  test_data <- spread_by_experiment[test_idx,]
+  
+  # reject samples that have missing levels
+  num_suff_levels <- sum(table(train_data$suff_level) > 0)
+  num_comp_levels <- sum(table(train_data$comp_level) > 0)
+  if (num_suff_levels < 3 | num_comp_levels < 2) {next} # CLEVR-XAI / GQA condition
+  # if (num_suff_levels < 2 | num_comp_levels < 3) {next} # HAT condition
+  # if (num_suff_levels < 2 | num_comp_levels < 2) {next} # LXMERT+XAI condition
+
+  model_pred_prob <- lm(OOD_acc ~ acc + output_pred, data=train_data)
+  model_exp <- lm(OOD_acc ~ acc + align_score + align_score_comp, data=train_data)
+  model_linear <- lm(OOD_acc ~ acc + RRR_suff + RRR_inv + RRR_unc_pred + output_pred + suff_model + comp_model + suff_level + comp_level + plau_rank_corr, data=train_data)
+  model_RRR <- lm(OOD_acc ~ acc + RRR_suff + RRR_inv + RRR_unc_pred, data=train_data)
+  
+  train_cors_acc[i] = cor(train_data$acc, train_data$OOD_acc, method='pearson')
+  train_cors_pred_prob[i] = cor(predict(model_pred_prob, train_data), train_data$OOD_acc, method='pearson')
+  train_cors_exp[i] = cor(predict(model_exp, train_data), train_data$OOD_acc, method='pearson')
+  train_cors_linear[i] = cor(predict(model_linear, train_data), train_data$OOD_acc, method='pearson')
+  train_cors_RRR[i] = cor(predict(model_RRR, train_data), train_data$OOD_acc, method='pearson')
+  
+  train_cors_suff[i] = cor(train_data$RRR_suff, train_data$OOD_acc, method='pearson')
+  train_cors_inv[i] = cor(train_data$RRR_inv, train_data$OOD_acc, method='pearson')
+  train_cors_unc[i] = cor(train_data$RRR_unc_pred, train_data$OOD_acc, method='pearson')
+  train_cors_align_score[i] = cor(train_data$align_score, train_data$OOD_acc, method='pearson')
+  
+  test_cors_acc[i] = cor(test_data$acc, test_data$OOD_acc, method='pearson')
+  test_cors_pred_prob[i] = cor(predict(model_pred_prob, test_data), test_data$OOD_acc, method='pearson')
+  test_cors_exp[i] = cor(predict(model_exp, test_data), test_data$OOD_acc, method='pearson')
+  test_cors_linear[i] = cor(predict(model_linear, test_data), test_data$OOD_acc, method='pearson')
+  test_cors_RRR[i] = cor(predict(model_RRR, test_data), test_data$OOD_acc, method='pearson')
+  
+  test_cors_suff[i] = cor(test_data$RRR_suff, test_data$OOD_acc, method='pearson')
+  test_cors_inv[i] = cor(test_data$RRR_inv, test_data$OOD_acc, method='pearson')
+  test_cors_unc[i] = cor(test_data$RRR_unc_pred, test_data$OOD_acc, method='pearson')
+  test_cors_align_score[i] = cor(test_data$align_score, test_data$OOD_acc, method='pearson')
+}
+
+"train metrics"
+sprintf("acc: %.4f", round(mean(train_cors_acc, na.rm = TRUE),3))
+sprintf("pred-prob: %.4f", round(mean(train_cors_pred_prob, na.rm = TRUE),3))
+sprintf("exp: %.4f", round(mean(train_cors_exp, na.rm = TRUE),3))
+sprintf("suff: %.4f", round(mean(train_cors_suff, na.rm = TRUE),3))
+sprintf("unc: %.4f", round(mean(train_cors_unc, na.rm = TRUE),3))
+sprintf("inv: %.4f", round(mean(train_cors_inv, na.rm = TRUE),3))
+sprintf("align: %.4f", round(mean(train_cors_align_score, na.rm = TRUE),3))
+sprintf("RRR: %.4f", round(mean(train_cors_RRR, na.rm = TRUE),3))
+sprintf("linear: %.4f", round(mean(train_cors_linear, na.rm = TRUE),3))
+
+"test metrics"
+sprintf("acc: %.4f", round(mean(test_cors_acc, na.rm = TRUE),3))
+sprintf("pred-prob: %.4f", round(mean(test_cors_pred_prob, na.rm = TRUE),3))
+sprintf("exp: %.4f", round(mean(test_cors_exp, na.rm = TRUE),3))
+sprintf("suff: %.4f", round(mean(test_cors_suff, na.rm = TRUE),3))
+sprintf("unc: %.4f", round(mean(test_cors_unc, na.rm = TRUE),3))
+sprintf("inv: %.4f", round(mean(test_cors_inv, na.rm = TRUE),3))
+sprintf("align: %.4f", round(mean(test_cors_align_score, na.rm = TRUE),3))
+sprintf("RRR: %.4f", round(mean(test_cors_RRR, na.rm = TRUE),3))
+sprintf("linear: %.4f", round(mean(test_cors_linear, na.rm = TRUE),3))
+
+"CI interval"
+qs <- quantile(test_cors_acc, c(.025, .975), na.rm = TRUE)
+sprintf("acc: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+qs <- quantile(test_cors_pred_prob, c(.025, .975), na.rm = TRUE)
+sprintf("pred-prob: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+qs <- quantile(test_cors_suff, c(.025, .975), na.rm = TRUE)
+sprintf("exp: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+qs <- quantile(test_cors_exp, c(.025, .975), na.rm = TRUE)
+sprintf("suff: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+qs <- quantile(test_cors_unc, c(.025, .975), na.rm = TRUE)
+sprintf("unc: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+qs <- quantile(test_cors_inv, c(.025, .975), na.rm = TRUE)
+sprintf("inv: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+qs <- quantile(test_cors_align_score, c(.025, .975), na.rm = TRUE)
+sprintf("align: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+qs <- quantile(test_cors_RRR, c(.025, .975), na.rm = TRUE)
+sprintf("RRR: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+qs <- quantile(test_cors_linear, c(.025, .975), na.rm = TRUE)
+sprintf("linear: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+
+"hypothesis testing"
+"pred prob vs acc"
+diffs <- test_cors_pred_prob - test_cors_acc
+sprintf("diff: %.4f", mean(diffs, na.rm=TRUE))
+qs <- quantile(diffs, c(.025, .975), na.rm = TRUE)
+sprintf("CI: %.4f", round(as.double((qs[2] - qs[1]) / 200), 4)) 
+
+```
+
+```{r hypothesis testing for improvements in metrics}
+
+bootTimes = 10000
+
+comparisons <- list()
+comparisons[[1]] <- c('MAIN1_baseline', 'MAIN6_gradcam')
+comparisons[[2]] <- c('MAIN1_BaselineCF', 'MAIN6_gradcam')
+comparisons[[3]] <- c('MAIN5_Singla2022', 'MAIN6_gradcam')
+comparisons[[4]] <- c('MAIN1_BaselineCF', 'MAIN6_SuffUncertAlignFI0_gradcam')
+comparisons[[5]] <- c('MAIN5_Singla2022', 'MAIN6_SuffUncertAlignFI0_gradcam')
+
+new_comparisons <- list()
+datasets <- data %>% 
+  pull(dataset) %>% 
+  unique()
+new_counter <- 1
+for (comparison in comparisons){
+  experiment1 <- comparison[1]
+  experiment2 <- comparison[2]
+  for (dataset in datasets){
+    new_comparisons[[new_counter]] <- c(
+      sprintf('%s.updn.%s', dataset, experiment1),
+      sprintf('%s.updn.%s', dataset, experiment2)
+    ) 
+    new_counter <- new_counter + 1
+  }
+}
+comparisons <- new_comparisons
+
+all_experiments <- data %>% 
+  pull(experiment_x_model_name) %>% 
+  unique()
+all_metrics <- c("acc", "OOD_acc")
+# all_metrics <- c("RRR_suff", "RRR_inv", "RRR_unc_pred", "plau_rank_corr", "suff_model", "comp_model")
+
+# make results df
+results_df <- data.frame(experiment=all_experiments)
+for (metric in all_metrics){
+  results_df[[metric]] = rep(NA, nrow(results_df))
+}
+comparison_df <- data.frame(comparison=NA, result=NA)
+
+# first bootstrap metrics individually for conditions
+for (experiment in all_experiments){
+  for (metric in all_metrics){
+    key <- paste(experiment, metric, sep='.')
+    print(key)
+    if (metric == 'OOD_acc'){
+      get_split = 'OOD'
+      get_metric = 'acc'
+    } else{
+      get_split = 'ID'
+      get_metric = metric
+    }
+    grid_data <- by_data_point %>% 
+      filter(grepl(experiment, experiment_x_model_name)) %>%
+      filter(split == get_split) %>%
+      select(qid, seed_num, all_of(get_metric)) %>%
+      mutate(unique_id = paste(qid, seed_num, sep='.')) %>%
+      distinct(unique_id, .keep_all=TRUE) %>% # a small number of duplicated qids in GQA data
+      select(-unique_id) %>%
+      spread(seed_num, get_metric) %>%
+      select(-qid)
+      
+    res <- bootstrapGRID(grid_data, bootTimes=bootTimes, print_p=FALSE)
+    print(res)
+    
+    row_idx = which(all_experiments == experiment)
+    col_idx = which(all_metrics == metric) + 1
+    results_df[row_idx, col_idx] = res
+  }
+}
+
+print(results_df)
+write_csv(results_df, sprintf('results/bootstrap_results_%d.csv', bootTimes))
+
+# next, bootstrap comparisons in a matched setup 
+row_counter <- 1
+for (comparison in comparisons){
+  for (metric in all_metrics){
+    if (is.null(comparison)){
+      next
+    }
+    if (metric == 'OOD_acc'){
+      get_split = 'OOD'
+      get_metric = 'acc'
+    } else{
+      get_split = 'ID'
+      get_metric = metric
+    }
+    
+    experiment <- comparison[1]
+    grid_data1 <- by_data_point %>% 
+      filter(grepl(experiment, experiment_x_model_name)) %>%
+      filter(split == get_split) %>%
+      select(qid, seed_num, all_of(get_metric)) %>%
+      mutate(unique_id = paste(qid, seed_num, sep='.')) %>%
+      distinct(unique_id, .keep_all=TRUE) %>% # a small number of duplicated qids in GQA data
+      select(-unique_id) %>%
+      spread(seed_num, get_metric) %>%
+      select(-qid)
+    experiment <- comparison[2]
+    grid_data2 <- by_data_point %>% 
+      filter(grepl(experiment, experiment_x_model_name)) %>%
+      filter(split == get_split) %>%
+      select(qid, seed_num, all_of(get_metric)) %>%
+      mutate(unique_id = paste(qid, seed_num, sep='.')) %>%
+      distinct(unique_id, .keep_all=TRUE) %>% # a small number of duplicated qids in GQA data
+      select(-unique_id) %>%
+      spread(seed_num, get_metric) %>%
+      select(-qid)
+    if (nrow(grid_data1) == 0) {next}
+    if (nrow(grid_data2) == 0) {next}
+    grid_data = grid_data1 - grid_data2
+    res <- bootstrapGRID(grid_data, bootTimes=bootTimes, print_p=TRUE)
+    
+    key <- paste(comparison[1], comparison[2], sep=' vs. ')
+    key <- paste(key, metric, sep=' | ')
+    
+    print(paste(key, res, sep= ' = '))
+    comparison_df[row_counter,'comparison'] = key
+    comparison_df[row_counter,'result'] = res
+    row_counter <- row_counter + 1
+  }
+}
+
+print(comparison_df)
+write_csv(comparison_df, sprintf('results/hypothesis_test_results_%d.csv', bootTimes))
+  
+```
+
