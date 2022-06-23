@@ -1,6 +1,6 @@
 # VisFIS
 
-VisFIS: Improved Visual Feature Importance Supervision with Right-for-Right-Reason Objectives
+[VisFIS: Visual Feature Importance Supervision with Right-for-the-Right-Reason Objectives](https://arxiv.org/abs/2206.11212)
 
 Zhuofan Ying*, Peter Hase*, Mohit Bansal
 
@@ -64,8 +64,14 @@ The `analysis/` directory contains R scripts that read `.pkl` files of metrics a
 This code used resources from [negative analysis of grounding](https://github.com/erobic/negative_analysis_of_grounding), [ramen](https://github.com/erobic/ramen), and [bottom-up-attention-vqa
 ](https://github.com/hengyuan-hu/bottom-up-attention-vqa). 
 
+## Citation
 
-
-## License
-
-MIT
+If you find this code useful for your research, please consider citing:
+```
+@inproceedings{ying2022visfis,
+  title={VisFIS: Visual Feature Importance Supervision with Right-for-the-Right-Reason Objectives},
+  author = {Ying, Zhuofan and Hase, Peter and Bansal, Mohit},
+  booktitle={arXiv},
+  year={2022}
+}
+```
